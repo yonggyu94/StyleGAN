@@ -21,6 +21,51 @@ class WrongNonLinearException(Exception):
         return 'You should choose \'relu\', \'leaky_relu\' or \'tanh\''
 
 
+class EqualLR:
+    def __init__(self, name):
+        self.name = name
+
+    def compute_weight(self, module):
+        weight = getattr(module, self.name + '_orig')
+        fan_in = weight.data.size(1) * weight.data[0][0].numel()
+
+        return weight * math.sqrt(2 / fan_in)
+
+    @staticmethod
+    def apply(module, name):
+        fn = EqualLR(name)
+
+        weight = getattr(module, name)
+        del module._parameters[name]
+        module.register_parameter(name + '_orig', nn.Parameter(weight.data))
+        module.register_forward_pre_hook(fn)
+
+        return fn
+
+    def __call__(self, module, input):
+        weight = self.compute_weight(module)
+        setattr(module, self.name, weight)
+
+
+def equal_lr(module, name='weight'):
+    EqualLR.apply(module, name)
+
+    return module
+
+
+class EqualizedConv2d(nn.Module):
+    def __init__(self, in_ch, out_ch, k_size, stride, padding):
+        super(EqualizedConv2d, self).__init__()
+        conv = nn.Conv2d(in_ch, out_ch, k_size, stride, padding)
+        conv.weight.data.normal_()
+        conv.bias.data.zero_()
+        self.conv = equal_lr(conv)
+
+    def forward(self, x):
+        out = self.conv(x)
+        return out
+
+
 class AffineBlock(nn.Module):
     def __init__(self, in_dim, out_dim, n_slope=0.01, norm="SN", non_linear='relu'):
         super(AffineBlock, self).__init__()
