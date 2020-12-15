@@ -56,17 +56,17 @@ if __name__ == '__main__':
 
     # Config - Path
     parser.add_argument('--data_root', type=str, default="/home/nas1_userC/yonggyu/dataset/FFHQ")
-    parser.add_argument('--exp', type=str, default='PGGAN_512')
+    parser.add_argument('--exp', type=str, default='StyleGAN_512')
     parser.add_argument('--log_dir', type=str, default='log')
     parser.add_argument('--model_dir', type=str, default='model')
     parser.add_argument('--sample_dir', type=str, default='sample')
     parser.add_argument('--result_dir', type=str, default='result')
 
     # Config - Miscellanceous
-    parser.add_argument('--print_loss_iter', type=int, default=5000)
-    parser.add_argument('--save_image_iter', type=int, default=5000)
-    parser.add_argument('--save_parameter_iter', type=int, default=5000)
-    parser.add_argument('--save_log_iter', type=int, default=1000)
+    parser.add_argument('--print_loss_iter', type=int, default=2)
+    parser.add_argument('--save_image_iter', type=int, default=2)
+    parser.add_argument('--save_parameter_iter', type=int, default=2)
+    parser.add_argument('--save_log_iter', type=int, default=2)
     config = parser.parse_args()
 
     print(config)

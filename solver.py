@@ -6,6 +6,7 @@ import torch.optim.lr_scheduler as lr_scheduler
 
 from model import Generator
 from model import Discriminator
+from model import MappingNetwork
 
 from dataloader import data_loader
 from utils import cycle
@@ -37,7 +38,7 @@ class Solver():
         self.max_iter = config.max_iter
 
         # Config - Test
-        self.fixed_z = torch.rand(128, config.z_dim, 1, 1).to(dev)
+        self.fixed_z = torch.rand(256, config.z_dim).to(dev)
 
         # Config - Path
         self.data_root = config.data_root
@@ -58,12 +59,16 @@ class Solver():
         self.G = Generator(channel_list=self.channel_list)
         self.G_ema = Generator(channel_list=self.channel_list)
         self.D = Discriminator(channel_list=self.channel_list)
+        self.M = MappingNetwork(z_dim=self.z_dim)
 
         self.G = DataParallel(self.G).to(dev)
         self.G_ema = DataParallel(self.G_ema).to(dev)
         self.D = DataParallel(self.D).to(dev)
+        self.M = DataParallel(self.M).to(dev)
 
-        self.g_optimizer = torch.optim.Adam(params=self.G.parameters(), lr=self.g_lr, betas=[self.beta1, self.beta2])
+        G_M_params = list(self.G.parameters()) + list(self.M.parameters())
+
+        self.g_optimizer = torch.optim.Adam(params=G_M_params, lr=self.g_lr, betas=[self.beta1, self.beta2])
         self.d_optimizer = torch.optim.Adam(params=self.D.parameters(), lr=self.d_lr, betas=[self.beta1, self.beta2])
 
         self.g_scheduler = lr_scheduler.StepLR(self.g_optimizer, step_size=self.decay_iter, gamma=self.decay_ratio)
@@ -79,28 +84,36 @@ class Solver():
         self.G = Generator(channel_list=channel_list)
         self.G_ema = Generator(channel_list=channel_list)
         self.D = Discriminator(channel_list=channel_list)
+        self.M = MappingNetwork(z_dim=self.z_dim)
 
         self.G = DataParallel(self.G).to(dev)
         self.G_ema = DataParallel(self.G_ema).to(dev)
         self.D = DataParallel(self.D).to(dev)
+        self.M = DataParallel(self.M).to(dev)
 
         self.G.load_state_dict(ckpt["G"])
         self.G_ema.load_state_dict(ckpt["G_ema"])
         self.D.load_state_dict(ckpt["D"])
+        self.M.load_state_dict(ckpt["M"])
 
     def save_model(self, iters, step):
         file_name = 'ckpt_%d_%d.pkl' % ((2*(2**(step+1)), iters))
         ckpt_path = os.path.join(self.model_root, file_name)
         ckpt = {
-            'G': self.G_ema.state_dict(),
+            'M': self.M.state_dict(),
+            'G': self.G.state_dict(),
+            'G_ema': self.G_ema.state_dict(),
             'D': self.D.state_dict()
         }
         torch.save(ckpt, ckpt_path)
 
-    def save_img(self, iters, fixed_z, step):
+    def save_img(self, iters, fixed_w, step):
         img_path = os.path.join(self.sample_root, "%d_%d.png" % (2*(2**(step+1)), iters))
         with torch.no_grad():
-            generated_imgs = self.G_ema(fixed_z[:self.batch_size].to(dev), step, 1)
+            fixed_w = fixed_w[:self.batch_size*2]
+            w1, w2 = torch.split(fixed_w, self.batch_size, dim=0)
+            const = torch.ones(self.batch_size, 512, 4, 4).to(dev)
+            generated_imgs = self.G_ema(const, w1, w2, step, 1)
             save_image(make_grid(generated_imgs.cpu()/2+1/2, nrow=4, padding=2), img_path)
 
     def reset_grad(self):
@@ -116,10 +129,13 @@ class Solver():
             self.G.train()
             self.G_ema.train()
             self.D.train()
+            self.M.train()
+
         elif mode == "test":
             self.G.eval()
             self.G_ema.eval()
             self.D.eval()
+            self.M.eval()
 
     def exponential_moving_average(self, beta=0.999):
         with torch.no_grad():
@@ -153,18 +169,17 @@ class Solver():
             loader = iter(cycle(loader))
 
             if step == 0 or step == 1 or step == 2:
-                self.max_iter = 20000
+                self.max_iter = 4
             elif step == 3 or step == 4 or step == 5:
-                self.max_iter = 50000
+                self.max_iter = 4
             else:
-                self.max_iter = 100000
+                self.max_iter = 4
 
             alpha = 0.0
 
             for iters in range(self.max_iter+1):
                 real_img = next(loader)
                 real_img = real_img.to(dev)
-
                 # ===============================================================#
                 #                    1. Train the discriminator                  #
                 # ===============================================================#
@@ -176,8 +191,11 @@ class Solver():
                 d_loss_real = - d_real_out.mean()
 
                 # Compute loss with face images.
-                z = torch.rand(self.batch_size, self.z_dim, 1, 1).to(dev)
-                fake_img = self.G(z, step, alpha)
+                const = torch.ones(self.batch_size, 512, 4, 4).to(dev)
+                z = torch.randn(2 * self.batch_size, self.z_dim).to(dev)
+                w = self.M(z)
+                w1, w2 = torch.split(w, self.batch_size, dim=0)
+                fake_img = self.G(const, w1, w2, step, alpha)
                 d_fake_out = self.D(fake_img.detach(), step, alpha)
                 d_loss_fake = d_fake_out.mean()
 
@@ -200,7 +218,11 @@ class Solver():
                     self.reset_grad()
 
                     # Compute loss with fake images.
-                    fake_img = self.G(z, step, alpha)
+                    const = torch.ones(self.batch_size, 512, 4, 4).to(dev)
+                    z = torch.randn(2 * self.batch_size, self.z_dim).to(dev)
+                    w = self.M(z)
+                    w1, w2 = torch.split(w, self.batch_size, dim=0)
+                    fake_img = self.G(const, w1, w2, step, alpha)
                     d_fake_out = self.D(fake_img, step, alpha)
                     g_loss = - d_fake_out.mean()
 
@@ -226,7 +248,8 @@ class Solver():
 
                 # Save generated images.
                 if iters % self.save_image_iter == 0:
-                    self.save_img(iters, self.fixed_z, step)
+                    fixed_w = self.M(self.fixed_z)
+                    self.save_img(iters, fixed_w, step)
 
                 # Save the G and D parameters.
                 if iters % self.save_parameter_iter == 0:
