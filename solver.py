@@ -38,7 +38,7 @@ class Solver():
         self.max_iter = config.max_iter
 
         # Config - Test
-        self.fixed_z = torch.rand(256, config.z_dim).to(dev)
+        self.fixed_z = torch.rand(512, config.z_dim).to(dev)
 
         # Config - Path
         self.data_root = config.data_root

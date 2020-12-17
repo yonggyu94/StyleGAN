@@ -5,7 +5,6 @@ from torch.backends import cudnn
 
 channel_list = [512, 512, 512, 512, 256, 128, 64, 32]
 
-
 def main(config):
     # find optimal set of algorithm on our configuration setting
     cudnn.benchmark = True
