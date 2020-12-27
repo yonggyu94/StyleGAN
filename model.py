@@ -5,6 +5,7 @@ import numpy as np
 import torch.nn.utils.spectral_norm as spectral_norm
 from torch.autograd import Function
 import math
+import random
 
 ''' Device type'''
 dev = 'cpu'
@@ -100,7 +101,7 @@ class AdaptiveInstanceNorm(nn.Module):
     def __init__(self, in_ch, w_dim=512):
         super(AdaptiveInstanceNorm, self).__init__()
         self.in_ch = in_ch
-        self.linear = nn.Linear(w_dim, self.in_ch * 2)
+        self.linear = EqualizedLinear(w_dim, self.in_ch * 2)
         self.instance_norm = nn.InstanceNorm2d(self.in_ch * 2)
 
     def forward(self, x, w):
@@ -145,9 +146,9 @@ class Blur(nn.Module):
 
 
 class FusedUpsample(nn.Module):
-    def __init__(self, out_ch, in_ch, k_size, stride, padding):
+    def __init__(self, in_ch, out_ch, k_size, stride, padding):
         super(FusedUpsample, self).__init__()
-        weight = torch.randn(out_ch, in_ch, k_size, k_size)
+        weight = torch.randn(in_ch, out_ch, k_size, k_size)
         bias = torch.zeros(out_ch)
         self.weight = nn.Parameter(weight)
         self.bias = nn.Parameter(bias)
@@ -298,8 +299,9 @@ class MappingNetwork(nn.Module):
 
 
 class Generator(nn.Module):
-    def __init__(self, channel_list=[512, 512, 512, 512, 256, 128, 64, 32]):
+    def __init__(self, channel_list=[512, 512, 512, 512, 256, 128, 64, 32], style_mixing_prob=0.9):
         super(Generator, self).__init__()
+        self.style_mixing_prob = style_mixing_prob
         progress_layers = []
         to_rgb_layers = []
         for i in range(len(channel_list)):
@@ -318,12 +320,23 @@ class Generator(nn.Module):
         self.to_rgb = nn.ModuleList(to_rgb_layers)
 
     def forward(self, x, w1, w2, step=0, alpha=-1):
+        w1 = w1.unsqueeze(1).repeat(1, 2*(step+1), 1)
+        w2 = w2.unsqueeze(1).repeat(1, 2*(step+1), 1)
+
+        layer_idx = torch.from_numpy(np.arange(2*(step+1))[np.newaxis, :, np.newaxis]).to(dev)
+        if random.random() < self.style_mixing_prob:
+            mixing_cutoff = random.randint(1, 2*(step+1))
+        else:
+            mixing_cutoff = 2*(step+1)
+
+        dlatents_in = torch.where(layer_idx < mixing_cutoff, w1, w2)
+
         for i, (block, to_rgb) in enumerate(zip(self.progress, self.to_rgb)):
             if i > 0:
                 pre_out = out
-                out = block(out, w1, w2)
+                out = block(out, dlatents_in[:, 2*i], dlatents_in[:, 2*i+1])
             else:
-                out = block(x, w1, w2)
+                out = block(x, dlatents_in[:, 2*i], dlatents_in[:, 2*i+1])
 
             if i == step:
                 out = to_rgb(out)

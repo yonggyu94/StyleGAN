@@ -9,10 +9,11 @@ from model import Discriminator
 from model import MappingNetwork
 
 from dataloader import data_loader
-from utils import cycle
+from utils import cycle, WGANLoss, StyleGANLoss
 from torch.nn import DataParallel
 
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 dev = 'cpu'
 if torch.cuda.is_available():
@@ -34,18 +35,18 @@ class Solver():
         self.beta1 = config.beta1
         self.beta2 = config.beta2
         self.n_critic = config.n_critic
-        self.lambda_gp = config.lambda_gp
+        self.lambda_value = config.lambda_value
         self.max_iter = config.max_iter
+        self.loss_name = config.loss_name
 
         # Config - Test
-        self.fixed_z = torch.rand(512, config.z_dim).to(dev)
+        self.fixed_z = torch.randn(512, config.z_dim).to(dev)
 
         # Config - Path
         self.data_root = config.data_root
         self.log_root = config.log_root
         self.model_root = config.model_root
         self.sample_root = config.sample_root
-        self.result_root = config.result_root
 
         # Config - Miscellanceous
         self.print_loss_iter = config.print_loss_iter
@@ -77,6 +78,12 @@ class Solver():
         print("Print model G, D")
         print(self.G)
         print(self.D)
+
+    def build_loss(self):
+        if self.loss_name == "stylegan":
+            self.loss = StyleGANLoss(self.D)
+        elif self.loss_name == "wgan-gp":
+            self.loss = WGANLoss(self.D)
 
     def load_model(self, pkl_path, channel_list):
         ckpt = torch.load(pkl_path)
@@ -144,40 +151,26 @@ class Solver():
                 g_param = G_param_dict[name]
                 g_ema_param.copy_(beta * g_ema_param + (1. - beta) * g_param)
 
-    def gradient_penalty(self, y, x):
-        """Compute gradient penalty: (L2_norm(dy/dx) - 1)**2."""
-        weight = torch.ones(y.size()).to(dev)
-        dydx = torch.autograd.grad(outputs=y,
-                                   inputs=x,
-                                   grad_outputs=weight,
-                                   retain_graph=True,
-                                   create_graph=True,
-                                   only_inputs=True)[0]
-
-        dydx = dydx.view(dydx.size(0), -1)
-        dydx_l2norm = torch.sqrt(torch.sum(dydx**2, dim=1))
-        return torch.mean((dydx_l2norm-1)**2)
-
     def train(self):
         # build model
         self.build_model()
+        self.build_loss()
 
         for step in range(len(self.channel_list)):
-            if step > 4:
-                self.batch_size = self.batch_size // 2
+            self.batch_size = self.batch_size // 2
             loader = data_loader(self.data_root, self.batch_size, img_size=2 * (2 ** (step + 1)))
             loader = iter(cycle(loader))
 
             if step == 0 or step == 1 or step == 2:
-                self.max_iter = 4
+                self.max_iter = 20000
             elif step == 3 or step == 4 or step == 5:
-                self.max_iter = 4
+                self.max_iter = 50000
             else:
-                self.max_iter = 4
+                self.max_iter = 100000
 
             alpha = 0.0
 
-            for iters in range(self.max_iter+1):
+            for iters in tqdm(range(self.max_iter+1)):
                 real_img = next(loader)
                 real_img = real_img.to(dev)
                 # ===============================================================#
@@ -186,27 +179,19 @@ class Solver():
                 self.set_phase(mode="train")
                 self.reset_grad()
 
-                # Compute loss with real images.
-                d_real_out = self.D(real_img, step, alpha)
-                d_loss_real = - d_real_out.mean()
-
-                # Compute loss with face images.
+                # Generate fake images
                 const = torch.ones(self.batch_size, 512, 4, 4).to(dev)
                 z = torch.randn(2 * self.batch_size, self.z_dim).to(dev)
                 w = self.M(z)
                 w1, w2 = torch.split(w, self.batch_size, dim=0)
                 fake_img = self.G(const, w1, w2, step, alpha)
-                d_fake_out = self.D(fake_img.detach(), step, alpha)
-                d_loss_fake = d_fake_out.mean()
 
-                # Compute loss for gradient penalty.
-                beta = torch.rand(self.batch_size, 1, 1, 1).to(dev)
-                x_hat = (beta * real_img.data + (1 - beta) * fake_img.data).requires_grad_(True)
-                d_x_hat_out = self.D(x_hat, step, alpha)
-                d_loss_gp = self.gradient_penalty(d_x_hat_out, x_hat)
+                # Compute d_loss
+                d_real_loss, d_fake_loss, regularization = self.loss.d_loss(real_img, fake_img.detach(), step, alpha,
+                                                                            self.lambda_value)
 
                 # Backward and optimize.
-                d_loss = d_loss_real + d_loss_fake + self.lambda_gp * d_loss_gp
+                d_loss = d_real_loss + d_fake_loss + regularization
                 d_loss.backward()
                 self.d_optimizer.step()
 
@@ -223,8 +208,8 @@ class Solver():
                     w = self.M(z)
                     w1, w2 = torch.split(w, self.batch_size, dim=0)
                     fake_img = self.G(const, w1, w2, step, alpha)
-                    d_fake_out = self.D(fake_img, step, alpha)
-                    g_loss = - d_fake_out.mean()
+
+                    g_loss = self.loss.g_loss(fake_img, step, alpha)
 
                     # Backward and optimize.
                     g_loss.backward()
@@ -242,8 +227,8 @@ class Solver():
                 # Print total loss
                 if iters % self.print_loss_iter == 0:
                     print("Step : [%d/%d], Iter : [%d/%d], D_loss : [%.3f, %.3f, %.3f., %.3f], G_loss : %.3f" % (
-                        step, len(self.channel_list)-1, iters, self.max_iter, d_loss.item(), d_loss_real.item(),
-                        d_loss_fake.item(), d_loss_gp.item(), g_loss.item()
+                        step, len(self.channel_list)-1, iters, self.max_iter, d_loss.item(), d_real_loss.item(),
+                        d_fake_loss.item(), regularization.item(), g_loss.item()
                     ))
 
                 # Save generated images.
@@ -259,7 +244,6 @@ class Solver():
                 if iters % self.save_log_iter == 0:
                     self.writer.add_scalar('g_loss/g_loss', g_loss.item(), iters)
                     self.writer.add_scalar('d_loss/d_loss_total', d_loss.item(), iters)
-                    self.writer.add_scalar('d_loss/d_loss_real', d_loss_real.item(), iters)
-                    self.writer.add_scalar('d_loss/d_loss_fake', d_loss_fake.item(), iters)
-                    self.writer.add_scalar('d_loss/d_loss_gp', d_loss_gp.item(), iters)
-
+                    self.writer.add_scalar('d_loss/d_loss_real', d_real_loss.item(), iters)
+                    self.writer.add_scalar('d_loss/d_loss_fake', d_fake_loss.item(), iters)
+                    self.writer.add_scalar('d_loss/d_loss_gp', regularization.item(), iters)
